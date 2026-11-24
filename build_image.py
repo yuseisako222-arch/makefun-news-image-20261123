@@ -4,7 +4,7 @@ import argparse
 from dataclasses import dataclass
 from functools import cache
 from io import BytesIO
-from itertools import combinations
+from itertools import combinations, pairwise
 from math import dist
 from pathlib import Path
 import sys
@@ -256,47 +256,68 @@ def disk(pen, center, radius, fill):
     pen.ellipse((x - radius, y - radius, x + radius, y + radius), fill=fill)
 
 
-def project(lon_lat, size):
-    lon, lat = lon_lat
+def map_coordinates(longitude, latitude, width, height):
+    # The rectangular projection runs from 90° N to 56° S.
+    east = longitude + 180
+    south = 90 - latitude
+    return east * width / 360, south * height / 146
+
+
+def coastline_samples(columns, rows):
+    mask = Image.new("L", (columns, rows))
+    pen = ImageDraw.Draw(mask)
+    for outline in COASTLINES:
+        projected = (
+            map_coordinates(longitude, latitude, columns - 1, rows - 1)
+            for longitude, latitude in outline
+        )
+        pen.polygon([(round(x), round(y)) for x, y in projected], fill=255)
+    return mask.tobytes()
+
+
+def draw_map_grid(pen, size, stroke):
     width, height = size
-    return (lon + 180) * width / 360, (90 - lat) * height / 146
+    for meridian in range(-150, 180, 30):
+        x, _ = map_coordinates(meridian, 0, width, height)
+        pen.line(((x, 0), (x, height - 1)), fill=MAP_GRID, width=stroke)
+    for parallel in range(-30, 90, 30):
+        _, y = map_coordinates(0, parallel, width, height)
+        pen.line(((0, y), (width - 1, y)), fill=MAP_GRID, width=stroke)
 
 
-def map_artwork():
+def render_dotted_map():
     columns, rows = 185, 34
-    land = Image.new("1", (columns, rows))
-    coast_pen = ImageDraw.Draw(land)
-    for coast in COASTLINES:
-        points = [tuple(map(round, project(point, (columns - 1, rows - 1)))) for point in coast]
-        coast_pen.polygon(points, fill=1)
+    oversampling = 3
+    width, height = (side * oversampling for side in MAP_SIZE)
+    canvas = Image.new("RGB", (width, height), MAP_BACKGROUND)
+    pen = ImageDraw.Draw(canvas)
+    draw_map_grid(pen, canvas.size, oversampling)
 
-    scale = 3
-    width, height = MAP_SIZE
-    artwork = Image.new("RGB", (width * scale, height * scale), MAP_BACKGROUND)
-    pen = ImageDraw.Draw(artwork)
-    for lon in range(-150, 180, 30):
-        x, _ = project((lon, 0), artwork.size)
-        pen.line((x, 0, x, artwork.height - 1), fill=MAP_GRID, width=scale)
-    for lat in range(-30, 90, 30):
-        _, y = project((0, lat), artwork.size)
-        pen.line((0, y, artwork.width - 1, y), fill=MAP_GRID, width=scale)
-
-    dots = land.load()
-    for row in range(rows):
-        y = round(row * (artwork.height - 1) / (rows - 1))
-        for col in range(columns):
-            if dots[col, row]:
-                x = round(col * (artwork.width - 1) / (columns - 1))
-                disk(pen, (x, y), 4, MAP_DOT)
-    return artwork.resize(MAP_SIZE, Image.Resampling.LANCZOS)
+    # Space the samples across the full raster, including its edge pixels.
+    sample_x = [round(col * (width - 1) / (columns - 1)) for col in range(columns)]
+    sample_y = [round(row * (height - 1) / (rows - 1)) for row in range(rows)]
+    for index, on_land in enumerate(coastline_samples(columns, rows)):
+        if on_land:
+            row, column = divmod(index, columns)
+            disk(pen, (sample_x[column], sample_y[row]), 4, MAP_DOT)
+    return canvas.resize(MAP_SIZE, Image.Resampling.LANCZOS)
 
 
-def map_markers():
-    map_x, map_y = MAP_ORIGIN
-    for number, lon_lat, (dx, dy) in PINS:
-        x, y = project(lon_lat, MAP_SIZE)
-        anchor = (map_x + round(x), map_y + round(y))
-        yield number, anchor, (anchor[0] + dx, anchor[1] + dy)
+def locate_map_pins():
+    origin_x, origin_y = MAP_ORIGIN
+    positions = []
+    for number, (longitude, latitude), (offset_x, offset_y) in PINS:
+        local_x, local_y = map_coordinates(longitude, latitude, *MAP_SIZE)
+        x = origin_x + round(local_x)
+        y = origin_y + round(local_y)
+        positions.append((number, (x, y), (x + offset_x, y + offset_y)))
+    return positions
+
+
+def ticker_strip(width):
+    glyphs = sans(40, True).getmask(TICKER, mode="L")
+    coverage = Image.frombytes("L", glyphs.size, bytes(glyphs))
+    return coverage.resize((width, 8), Image.Resampling.LANCZOS)
 
 
 def mercury_artwork():
@@ -395,54 +416,55 @@ class FrontPage:
         self.rule(top)
         self.pen.text((MARGIN + 11, top + 8), "WHERE IT HAPPENED", font=sans(13, True),
                       fill=INK, anchor="lt")
-        self.image.paste(map_artwork(), MAP_ORIGIN)
+        self.image.paste(render_dotted_map(), MAP_ORIGIN)
         self.rule(bottom, HAIRLINE)
+        self.draw_map_pins()
 
-        markers = list(map_markers())
-        if any(dist(a[2], b[2]) < 30 for a, b in combinations(markers, 2)):
+    def draw_map_pins(self):
+        pins = locate_map_pins()
+        badge_centers = [center for _, _, center in pins]
+        if any(dist(first, second) < 30 for first, second in combinations(badge_centers, 2)):
             raise ValueError("Map badges need at least 30px center-to-center clearance")
-        if any(dist(anchor, center) < 18 for _, anchor, _ in markers for _, _, center in markers):
+        if any(dist(anchor, center) < 18 for _, anchor, _ in pins for center in badge_centers):
             raise ValueError("A map badge covers a geographic anchor")
 
-        for _, anchor, center in markers:
-            self.pen.line((*anchor, *center), fill=MAP_BACKGROUND, width=4)
-            self.pen.line((*anchor, *center), fill=RED, width=2)
-        for number, anchor, center in markers:
-            disk(self.pen, anchor, 4, PAPER)
-            disk(self.pen, anchor, 2.5, RED)
-            disk(self.pen, center, 14, PAPER)
-            self.badge(center, number, 12)
+        # Lay down every leader before marking the two ends.
+        for _, anchor, badge in pins:
+            for color, width in ((MAP_BACKGROUND, 4), (RED, 2)):
+                self.pen.line((anchor, badge), fill=color, width=width)
+        for number, anchor, badge in pins:
+            for center, radius, color in ((anchor, 4, PAPER), (anchor, 2.5, RED), (badge, 14, PAPER)):
+                disk(self.pen, center, radius, color)
+            self.badge(badge, number, 12)
 
     def data_bar(self):
-        top, bottom = 924, 970
-        self.pen.rectangle((MARGIN, top, RIGHT, bottom), fill=SAND)
-        self.rule(top, width=2)
-        edges = (MARGIN, 250, 430, 644, 826, RIGHT)
-        face = sans(11, True)
-        for text, left, right in zip(FIGURES, edges[:-1], edges[1:], strict=True):
-            label, value = text.split(": ", 1)
-            label += ":"
-            if ink_width(face, label) > right - left - 12:
+        bar_top, bar_bottom = 924, 970
+        label_y, value_y = bar_top + 8, bar_top + 21
+        label_font, value_font = sans(11, True), serif(23)
+        self.pen.rectangle(((MARGIN, bar_top), (RIGHT, bar_bottom)), fill=SAND)
+        self.rule(bar_top, width=2)
+
+        boundaries = (MARGIN, 250, 430, 644, 826, RIGHT)
+        for (start, end), figure in zip(pairwise(boundaries), FIGURES, strict=True):
+            title, value = figure.split(": ", maxsplit=1)
+            label = f"{title}:"
+            if ink_width(label_font, label) > (end - start) - 12:
                 raise ValueError(f"Data label overflows: {label}")
-            if left != MARGIN:
-                self.pen.line((left, top + 8, left, bottom - 6), fill=HAIRLINE)
-            x = (left + right) / 2
-            self.pen.text((x, top + 8), label, font=face, fill=INK, anchor="mt")
-            self.pen.text((x, top + 21), value, font=serif(23), fill=RED, anchor="mt")
+            if start > MARGIN:
+                self.pen.line(((start, label_y), (start, bar_bottom - 6)), fill=HAIRLINE)
+            midpoint = (start + end) / 2
+            self.pen.text((midpoint, label_y), label, font=label_font, fill=INK, anchor="mt")
+            self.pen.text((midpoint, value_y), value, font=value_font, fill=RED, anchor="mt")
 
     def ticker(self):
-        self.pen.rectangle((MARGIN, 976, RIGHT, 1008), fill=INK)
-        self.pen.text((MARGIN + 9, 981), "ALSO TODAY", font=sans(10, True), fill=GOLD, anchor="lt")
-        self.pen.line((MARGIN + 82, 985, RIGHT - 9, 985), fill="#80745E")
-
-        # Rasterize the complete line before fitting it to the available width.
-        face = sans(40, True)
-        left, top, right, bottom = face.getbbox(TICKER)
-        mask = Image.new("L", (right - left, bottom - top))
-        ImageDraw.Draw(mask).text((-left, -top), TICKER, font=face, fill=255)
-        width = RIGHT - MARGIN - 18
-        strip = mask.resize((width, 8), Image.Resampling.LANCZOS)
-        self.image.paste(PAPER, (MARGIN + 9, 995), strip)
+        panel_top = 976
+        left, right = MARGIN + 9, RIGHT - 9
+        self.pen.rectangle(((MARGIN, panel_top), (RIGHT, panel_top + 32)), fill=INK)
+        self.pen.text((left, panel_top + 5), "ALSO TODAY",
+                      font=sans(10, True), anchor="lt", fill=GOLD)
+        rule_y = panel_top + 9
+        self.pen.line(((left + 73, rule_y), (right, rule_y)), fill="#80745E")
+        self.image.paste(PAPER, (left, panel_top + 19), ticker_strip(right - left))
 
 
 def front_page():
